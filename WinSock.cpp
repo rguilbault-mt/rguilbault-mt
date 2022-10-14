@@ -17,14 +17,16 @@ enum class Switches
 	Port,
 	Delay,
 	Timeout,
-	GetOverlappedResult
+	GetOverlappedResult,
+	RegisterWaitForSingleObject
 };
 static std::map<std::string, Switches> gSwitches = {
 	{"-h",Switches::Host},
 	{"-p",Switches::Port},
 	{"-d",Switches::Delay},
 	{"-t",Switches::Timeout},
-	{"-gor",Switches::GetOverlappedResult}
+	{"-gor",Switches::GetOverlappedResult},
+	{"-rwfso",Switches::RegisterWaitForSingleObject}
 };
 
 enum class SocketState
@@ -57,6 +59,7 @@ public:
 	WSAOVERLAPPED ol;
 	SocketState state;
 	Buffer buffer;
+	HANDLE waiter;
 };
 
 struct ServerConfig
@@ -80,6 +83,7 @@ constexpr unsigned int DEFAULT_BUFSIZE = 1024;
 static uint32_t gDelay = 0;		// default to immediate response
 static uint32_t gTimeout = 0;	// default to infinite
 static bool gGetOverlappedResult = false;
+static bool gRegisterWait = false;
 
 static PTP_WAIT gAcceptsTpW = nullptr;
 static HANDLE gTaskCompleteEvt = NULL;
@@ -272,86 +276,6 @@ public:
 
 		return (*connectEx)(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
 	}
-
-	static bool SetBlockingRead(SOCKET s)
-	{
-		u_long truth = 1;
-		int r = ioctlsocket(s, FIONBIO, &truth);
-		if (r == SOCKET_ERROR)
-		{
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cerr << preamble(__func__) << "ioctlsocket failed: " << WSAGetLastError() << std::endl;
-			return false;
-		}
-		else
-		{
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cout << preamble(__func__) << "ioctlsocket succeeded: " << std::endl;
-			std::cout << "\tSocket: " << s << std::endl;
-			std::cout << "\tOption: " << FIONBIO << std::endl;
-			std::cout << "\tValue: " << truth << std::endl;
-		}
-		return true;
-	}
-
-	static bool SetSocketTimeout(SOCKET s, uint32_t timeout)
-	{
-		bool success = true;
-		// set both send and recv timeout the same
-		if (setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout)) == SOCKET_ERROR)
-		{
-			success = false;
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cerr << preamble(__func__) << "setsockopt failed: " << WSAGetLastError() << std::endl;
-		}
-		else
-		{
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cout << preamble(__func__) << "setsockopt succeeded: " << std::endl;
-			std::cout << "\tSocket: " << s << std::endl;
-			std::cout << "\tOption: " << SO_SNDTIMEO << std::endl;
-			std::cout << "\tValue: " << timeout << std::endl;
-		}
-
-		if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) == SOCKET_ERROR)
-		{
-			success = false;
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cerr << preamble(__func__) << "setsockopt failed: " << WSAGetLastError() << std::endl;
-		}
-		else
-		{
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cout << preamble(__func__) << "setsockopt succeeded: " << std::endl;
-			std::cout << "\tSocket: " << s << std::endl;
-			std::cout << "\tOption: " << SO_RCVTIMEO << std::endl;
-			std::cout << "\tValue: " << timeout << std::endl;
-		}
-
-		return success;
-	}
-
-	static bool Poll(SOCKET s)
-	{
-		WSAPOLLFD pfd;
-		ZeroMemory(&pfd, sizeof(pfd));
-		pfd.fd = s;
-		pfd.events = POLLIN;
-		WSAPOLLFD pfds[] = { pfd };
-		int nEvents = WSAPoll(pfds, 1, gTimeout);
-		if (nEvents == SOCKET_ERROR)
-		{
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cerr << preamble(__func__) << "WSAPoll failed: " << WSAGetLastError() << std::endl;
-			return false;
-		}
-		else
-		{
-			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cout << preamble(__func__) << "WSAPoll events: " << nEvents << std::endl;
-		}
-		return true;
-	}
 };
 
 SOCKET connect(std::string host, std::string port)
@@ -491,6 +415,58 @@ bool send(SOCKET s, std::string msg)
 	return true;
 }
 
+VOID CALLBACK unregisterWaiter(
+	PTP_CALLBACK_INSTANCE Instance,
+	PVOID                 Context
+)
+{
+	PHANDLE pWaitHandle = (PHANDLE)Context;
+	{
+		std::lock_guard<std::mutex> log(gIoMtx);
+		std::cout << preamble(__func__) << std::endl;
+		std::cout << "\Handle: " << (HANDLE)*pWaitHandle << std::endl;
+	}
+
+	if (!UnregisterWait(*pWaitHandle))
+	{
+		std::lock_guard<std::mutex> log(gIoMtx);
+		std::cerr << preamble(__func__) << "UnregisterWait failed: " << GetLastError() << std::endl;
+	}
+}
+
+VOID CALLBACK waitOrTimerCallback(
+	PVOID   lpParameter,
+	BOOLEAN TimedOut
+)
+{
+	IoData* ioData = (IoData*)lpParameter;
+	{
+		std::lock_guard<std::mutex> log(gIoMtx);
+		std::cout << preamble(__func__) << (TimedOut ? "true" : "false") << std::endl;
+		std::cout << "\tSocket: " << ioData->socket << std::endl;
+	}
+
+	if (!TimedOut)
+	{
+		std::lock_guard<std::mutex> log(gIoMtx);
+		std::cout << preamble(__func__) << "read activity is forthcoming" << std::endl;
+	}
+	else
+	{
+		// we hit our timeout, cancel the I/O
+		CancelIoEx((HANDLE)ioData->socket, &ioData->ol);
+		std::lock_guard<std::mutex> log(gIoMtx);
+		std::cout << preamble(__func__) << "timeout reached, cancelling I/O" << std::endl;
+	}
+
+	// need to unregister the waiter but not supposed to do it in the callback
+	if (!TrySubmitThreadpoolCallback(unregisterWaiter, &ioData->waiter, NULL))
+	{
+		std::lock_guard<std::mutex> log(gIoMtx);
+		std::cerr << preamble(__func__) << "failed to unregister waiter...does this mean I have a memory leak?" << std::endl;
+	}
+}
+
 bool read(SOCKET s)
 {
 	{
@@ -528,7 +504,7 @@ bool read(SOCKET s)
 		std::cout << preamble(__func__) << "synchronous - " << readBytes << " read" << std::endl;
 	}
 
-	if (gGetOverlappedResult)
+	if (gGetOverlappedResult && !gRegisterWait)
 	{
 		{
 			std::lock_guard<std::mutex> log(gIoMtx);
@@ -555,7 +531,20 @@ bool read(SOCKET s)
 		else
 		{
 			std::lock_guard<std::mutex> log(gIoMtx);
-			std::cerr << preamble(__func__) << "GetOverlappedResult success: " << bytesTransferred << std::endl;
+			std::cout << preamble(__func__) << "GetOverlappedResult success: " << bytesTransferred << std::endl;
+		}
+	}
+	else if (gRegisterWait)
+	{
+		if (!RegisterWaitForSingleObject(&ioData->waiter, (HANDLE)s, waitOrTimerCallback, ioData, gTimeout, WT_EXECUTEONLYONCE))
+		{
+			std::lock_guard<std::mutex> log(gIoMtx);
+			std::cerr << preamble(__func__) << "RegisterWaitForSingleObject failed: " << GetLastError() << std::endl;
+		}
+		else
+		{
+			std::lock_guard<std::mutex> log(gIoMtx);
+			std::cout << preamble(__func__) << "RegisterWaitForSingleObject success: " << ioData->waiter << std::endl;
 		}
 	}
 
@@ -653,7 +642,7 @@ int main(int argc, char* argv[])
 	std::string delay;
 	std::string timeout;
 
-	for (int i = 0; i < argc; i++)
+	for (int i = 1; i < argc; i++)
 	{
 
 		switch (gSwitches[argv[i]])
@@ -673,6 +662,9 @@ int main(int argc, char* argv[])
 		case Switches::GetOverlappedResult:
 			gGetOverlappedResult = true;
 			break;
+		case Switches::RegisterWaitForSingleObject:
+			gRegisterWait = true;
+			break;
 		default:
 			std::cerr
 				<< preamble(__func__)
@@ -682,9 +674,10 @@ int main(int argc, char* argv[])
 	}
 
 	std::cout << preamble(__func__) << "Host: " << host << ", Port: " << port << std::endl;
-	std::cout << "Delay: " << delay << std::endl;
-	std::cout << "Timeout: " << timeout << std::endl;
-	std::cout << "Get Overlapped Result: " << gGetOverlappedResult << std::endl;
+	std::cout << "\tDelay: " << delay << std::endl;
+	std::cout << "\tTimeout: " << timeout << std::endl;
+	std::cout << "\tUse GetOverlappedResult: " << gGetOverlappedResult << std::endl;
+	std::cout << "\tUse RegisterWaitForSingleObject: " << gRegisterWait << std::endl;
 
 	if (port.empty())
 	{
